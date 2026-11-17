@@ -1,16 +1,24 @@
 package com.fullscreen.browser
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.DownloadManager
 import android.content.ActivityNotFoundException
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
 import android.text.InputType
+import android.util.Base64
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowInsets
@@ -18,6 +26,9 @@ import android.view.WindowInsetsController
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
+import android.webkit.MimeTypeMap
+import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
@@ -27,6 +38,13 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.Toast
+import org.json.JSONObject
+import java.io.File
+import java.io.IOException
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
  * Navegador a pantalla completa: muestra cualquier pagina web sin la barra de Chrome
@@ -45,6 +63,11 @@ class MainActivity : Activity() {
     private var customViewCallback: WebChromeClient.CustomViewCallback? = null
     private var lastFailedUrl: String? = null
     private lateinit var chromeClient: WebChromeClient
+
+    /** Archivo esperando el permiso de almacenamiento (solo Android 9 o anterior). */
+    private var pendingSave: PendingFile? = null
+
+    private class PendingFile(val bytes: ByteArray, val name: String, val mime: String)
 
     private var cornerTaps = 0
     private var firstCornerTapAt = 0L
@@ -71,11 +94,16 @@ class MainActivity : Activity() {
         webView = WebView(this)
         root.addView(webView, FrameLayout.LayoutParams(MATCH, MATCH))
         setContentView(root)
+        // Pantalla completa ANTES de cargar la pagina, para que el editor (p. ej. Konva)
+        // calcule el tamano del lienzo con el tamano final.
+        enterImmersive()
 
-        // Como dibujamos detras de las barras, el teclado no redimensiona solo:
-        // dejamos espacio abajo igual a la altura del teclado.
+        // Por defecto, como Chrome: el teclado NO achica la pagina. Si la pagina se achica,
+        // editores como Konva recalculan el lienzo mas pequeno mientras escribes y el texto
+        // queda cortado. Se puede activar desde el menu oculto si un campo queda tapado.
         root.setOnApplyWindowInsetsListener { v, insets ->
-            val keyboard = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val keyboard = if (!resizeForKeyboard) 0
+            else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 insets.getInsets(WindowInsets.Type.ime()).bottom
             } else {
                 @Suppress("DEPRECATION")
@@ -84,16 +112,33 @@ class MainActivity : Activity() {
             v.setPadding(0, 0, 0, keyboard)
             insets
         }
+        applyKeyboardMode()
 
         setupWebView()
 
         if (savedInstanceState != null) {
             webView.restoreState(savedInstanceState)
-        } else if (!handleIntent(intent)) {
-            val home = homeUrl
-            if (home.isNullOrBlank()) showUrlDialog(firstRun = true) else webView.loadUrl(home)
+        } else {
+            // Esperamos a que la vista tenga su tamano de pantalla completa.
+            root.post {
+                if (!handleIntent(intent)) {
+                    val home = homeUrl
+                    if (home.isNullOrBlank()) showUrlDialog(firstRun = true) else webView.loadUrl(home)
+                }
+            }
         }
-        enterImmersive()
+    }
+
+    private var resizeForKeyboard: Boolean
+        get() = prefs.getBoolean(KEY_RESIZE_KEYBOARD, false)
+        set(value) = prefs.edit().putBoolean(KEY_RESIZE_KEYBOARD, value).apply()
+
+    private fun applyKeyboardMode() {
+        window.setSoftInputMode(
+            if (resizeForKeyboard) WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+            else WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
+        )
+        root.requestApplyInsets()
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -107,6 +152,11 @@ class MainActivity : Activity() {
             useWideViewPort = true
             builtInZoomControls = true
             displayZoomControls = false
+            // Ignora el tamano de letra del sistema: si no, el WebView agranda el texto
+            // y en el editor las cajas de texto se desbordan y salen cortadas (Chrome no lo hace).
+            textZoom = 100
+            minimumFontSize = 1
+            minimumLogicalFontSize = 1
             allowFileAccess = false
             javaScriptCanOpenWindowsAutomatically = true
             // false = los enlaces que abren ventana nueva (target=_blank) se cargan aqui mismo.
@@ -139,6 +189,12 @@ class MainActivity : Activity() {
 
             override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
                 if (url != null && url.startsWith("http")) lastFailedUrl = null
+            }
+
+            override fun onPageFinished(view: WebView, url: String?) {
+                // Engancha las descargas de la pagina (a[download] con data: o blob:)
+                // para guardarlas completas desde la app.
+                if (url != null && url.startsWith("http")) view.evaluateJavascript(DOWNLOAD_JS, null)
             }
 
             override fun onReceivedError(
@@ -195,12 +251,154 @@ class MainActivity : Activity() {
 
         webView.webChromeClient = chromeClient
 
-        webView.setDownloadListener { url, _, _, _, _ ->
+        webView.addJavascriptInterface(DownloadBridge(), "AndroidDownload")
+
+        // Respaldo por si la pagina descarga de una forma que el script no engancho.
+        webView.setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
+            when {
+                url.startsWith("data:") -> saveDataUrl(url, "", mimeType ?: "")
+                url.startsWith("blob:") -> webView.evaluateJavascript(
+                    DOWNLOAD_JS + ";window.__fsSaveUrl(" + JSONObject.quote(url) + ",'')", null
+                )
+                else -> downloadHttp(url, userAgent, contentDisposition, mimeType)
+            }
+        }
+    }
+
+    // ---------- Descargas ----------
+
+    /** Recibe desde JavaScript el archivo completo como data: URL. */
+    private inner class DownloadBridge {
+        @JavascriptInterface
+        fun save(dataUrl: String, name: String, type: String) {
+            runOnUiThread { saveDataUrl(dataUrl, name, type) }
+        }
+
+        @JavascriptInterface
+        fun error(message: String) {
+            runOnUiThread { toast("No se pudo descargar: $message") }
+        }
+    }
+
+    /**
+     * Antes la data: URL se pasaba a otra app con Uri.parse(), que corta todo lo que
+     * va despues del primer '#' (p. ej. fill="#ff0000" en un SVG). Ahora se decodifica
+     * aqui entera y se guarda en Descargas.
+     */
+    private fun saveDataUrl(dataUrl: String, name: String, type: String) {
+        val comma = dataUrl.indexOf(',')
+        if (!dataUrl.startsWith("data:") || comma < 0) {
+            toast("No se pudo descargar: formato no valido"); return
+        }
+        val meta = dataUrl.substring(5, comma).split(';').map { it.trim() }
+        val payload = dataUrl.substring(comma + 1)
+        val bytes = try {
+            if (meta.any { it.equals("base64", ignoreCase = true) }) {
+                Base64.decode(Uri.decode(payload), Base64.DEFAULT)
+            } else {
+                Uri.decode(payload).toByteArray(Charsets.UTF_8)
+            }
+        } catch (e: IllegalArgumentException) {
+            toast("No se pudo descargar: datos danados"); return
+        }
+        val mime = type.ifBlank { meta.firstOrNull().orEmpty() }.ifBlank { "application/octet-stream" }
+        saveBytes(bytes, fileNameFor(name, mime), mime)
+    }
+
+    private fun fileNameFor(requested: String, mime: String): String {
+        var name = requested.substringAfterLast('/').replace(BAD_NAME_CHARS, "_").trim()
+        if (name.isEmpty() || name == "." || name == "..") {
+            name = "descarga-" + SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+        }
+        if (!name.contains('.')) {
+            val ext = if (mime.contains("svg")) "svg"
+            else MimeTypeMap.getSingleton().getExtensionFromMimeType(mime.substringBefore(';'))
+            if (ext != null) name += ".$ext"
+        }
+        return name
+    }
+
+    private fun saveBytes(bytes: ByteArray, name: String, mime: String) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, name)
+                    put(MediaStore.Downloads.MIME_TYPE, mime)
+                    put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                    put(MediaStore.Downloads.IS_PENDING, 1)
+                }
+                val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    ?: throw IOException("no se pudo crear el archivo")
+                (contentResolver.openOutputStream(uri) ?: throw IOException("no se pudo escribir"))
+                    .use { it.write(bytes) }
+                values.clear()
+                values.put(MediaStore.Downloads.IS_PENDING, 0)
+                contentResolver.update(uri, values, null, null)
+            } else {
+                if (checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                    != PackageManager.PERMISSION_GRANTED
+                ) {
+                    pendingSave = PendingFile(bytes, name, mime)
+                    requestPermissions(arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE), REQ_STORAGE)
+                    return
+                }
+                @Suppress("DEPRECATION")
+                val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                dir.mkdirs()
+                val base = name.substringBeforeLast('.')
+                val ext = if (name.contains('.')) "." + name.substringAfterLast('.') else ""
+                var file = File(dir, name)
+                var n = 1
+                while (file.exists()) {
+                    file = File(dir, "$base ($n)$ext")
+                    n++
+                }
+                file.writeBytes(bytes)
+                MediaScannerConnection.scanFile(this, arrayOf(file.absolutePath), arrayOf(mime), null)
+            }
+            toast("Guardado en Descargas: $name")
+        } catch (e: Exception) {
+            toast("No se pudo guardar: ${e.message}")
+        }
+    }
+
+    private fun downloadHttp(url: String, userAgent: String?, contentDisposition: String?, mimeType: String?) {
+        try {
+            val name = URLUtil.guessFileName(url, contentDisposition, mimeType)
+            val request = DownloadManager.Request(Uri.parse(url)).apply {
+                CookieManager.getInstance().getCookie(url)?.let { addRequestHeader("Cookie", it) }
+                userAgent?.let { addRequestHeader("User-Agent", it) }
+                if (!mimeType.isNullOrBlank()) setMimeType(mimeType)
+                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name)
+            }
+            (getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
+            toast("Descargando: $name")
+        } catch (_: Exception) {
             try {
                 startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
             } catch (_: ActivityNotFoundException) {
             }
         }
+    }
+
+    private fun toast(text: String) = Toast.makeText(this, text, Toast.LENGTH_LONG).show()
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        if (requestCode == REQ_STORAGE) {
+            val file = pendingSave
+            pendingSave = null
+            if (file != null) {
+                if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+                    saveBytes(file.bytes, file.name, file.mime)
+                } else {
+                    toast("Sin permiso de almacenamiento no se puede guardar")
+                }
+            }
+            enterImmersive()
+            return
+        }
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
     }
 
     private fun showErrorPage(reason: String) {
@@ -263,6 +461,8 @@ class MainActivity : Activity() {
             "Usar esta pagina como inicio",
             "Recargar",
             "Atras",
+            if (resizeForKeyboard) "Teclado: achicar la pagina (activado)"
+            else "Teclado: achicar la pagina (desactivado)",
             "Cerrar la app"
         )
         AlertDialog.Builder(this)
@@ -274,7 +474,11 @@ class MainActivity : Activity() {
                     2 -> webView.url?.takeIf { it.startsWith("http") }?.let { homeUrl = it }
                     3 -> webView.reload()
                     4 -> if (webView.canGoBack()) webView.goBack()
-                    5 -> finishAndRemoveTask()
+                    5 -> {
+                        resizeForKeyboard = !resizeForKeyboard
+                        applyKeyboardMode()
+                    }
+                    6 -> finishAndRemoveTask()
                 }
             }
             .setOnDismissListener { enterImmersive() }
@@ -385,7 +589,11 @@ class MainActivity : Activity() {
 
     companion object {
         private const val KEY_HOME_URL = "home_url"
+        private const val KEY_RESIZE_KEYBOARD = "resize_for_keyboard"
         private const val REQ_FILE = 1001
+        private const val REQ_STORAGE = 1002
+
+        private val BAD_NAME_CHARS = Regex("[\\\\/:*?\"<>|\\x00-\\x1f]")
         private const val CORNER_DP = 80
         private const val TAP_WINDOW_MS = 1500L
         private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
@@ -399,6 +607,66 @@ class MainActivity : Activity() {
             if (s.isEmpty()) return null
             return if (s.startsWith("http://") || s.startsWith("https://")) s else "https://$s"
         }
+
+        /**
+         * Se inyecta en cada pagina. Guarda los Blob que crea la pagina (y retrasa su
+         * borrado) para poder leerlos enteros, e intercepta los clics en <a download>
+         * con data: o blob: para mandar el archivo completo a la app.
+         */
+        private val DOWNLOAD_JS = """
+            (function(){
+              if (window.__fsSaveUrl) return;
+              var blobs = {}, order = [];
+              var origCreate = URL.createObjectURL, origRevoke = URL.revokeObjectURL;
+              URL.createObjectURL = function(o){
+                var u = origCreate.apply(URL, arguments);
+                try { if (o instanceof Blob) { blobs[u] = o; order.push(u);
+                  if (order.length > 30) delete blobs[order.shift()]; } } catch(e) {}
+                return u;
+              };
+              URL.revokeObjectURL = function(u){
+                setTimeout(function(){ origRevoke.call(URL, u); delete blobs[u]; }, 60000);
+              };
+              function send(blob, name){
+                var r = new FileReader();
+                r.onload = function(){ AndroidDownload.save(String(r.result), name || '', blob.type || ''); };
+                r.onerror = function(){ AndroidDownload.error('no se pudo leer el archivo'); };
+                r.readAsDataURL(blob);
+              }
+              window.__fsSaveUrl = function(href, name){
+                if (href.indexOf('data:') === 0) { AndroidDownload.save(href, name || '', ''); return true; }
+                if (href.indexOf('blob:') === 0) {
+                  if (blobs[href]) { send(blobs[href], name); return true; }
+                  fetch(href).then(function(r){ return r.blob(); })
+                    .then(function(b){ send(b, name); })
+                    .catch(function(e){ AndroidDownload.error(String(e)); });
+                  return true;
+                }
+                return false;
+              };
+              function handle(a){
+                if (!a || !a.hasAttribute || !a.hasAttribute('download')) return false;
+                var h = a.href || '';
+                if (h.indexOf('data:') !== 0 && h.indexOf('blob:') !== 0) return false;
+                return window.__fsSaveUrl(h, a.getAttribute('download'));
+              }
+              var origClick = HTMLAnchorElement.prototype.click;
+              HTMLAnchorElement.prototype.click = function(){
+                if (handle(this)) return;
+                return origClick.apply(this, arguments);
+              };
+              var origDispatch = EventTarget.prototype.dispatchEvent;
+              EventTarget.prototype.dispatchEvent = function(ev){
+                if (ev && ev.type === 'click' && this instanceof HTMLAnchorElement && handle(this)) return false;
+                return origDispatch.apply(this, arguments);
+              };
+              window.addEventListener('click', function(ev){
+                if (ev.defaultPrevented) return;
+                var a = ev.target && ev.target.closest ? ev.target.closest('a[download]') : null;
+                if (a && handle(a)) ev.preventDefault();
+              }, false);
+            })();
+        """.trimIndent()
 
         private fun String.htmlEscape() =
             replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
