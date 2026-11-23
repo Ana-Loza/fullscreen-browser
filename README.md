@@ -11,11 +11,13 @@ App Android que abre cualquier página web a pantalla completa, sin la barra de 
 - Si no hay internet, muestra un aviso y reintenta cada 10 segundos.
 - Soporta subir archivos, videos a pantalla completa, cookies y almacenamiento local (para que el login del editor se mantenga).
 
-## Cómo obtener el APK
+## Cómo instalar la app
 
-**Opción A, GitHub (sin instalar nada):** sube esta carpeta a un repositorio de GitHub. La acción *Build APK* compila sola en cada push; descarga el APK desde la pestaña **Actions → último build → Artifacts**.
-
-**Opción B, Android Studio:** abre esta carpeta con Android Studio y usa *Build → Build APK(s)*, o en terminal `./gradlew assembleRelease`. El APK queda en `app/build/outputs/apk/release/`.
+1. Ve a la pestaña **Actions** de este repositorio y abre el build más reciente que tenga el check verde ✅.
+2. Baja hasta **Artifacts** y descarga el archivo. Se descarga como un `.zip`.
+3. Descomprime el `.zip` y pasa el archivo `.apk` a tu tablet (por cable, Drive o correo).
+4. En la tablet, abre el `.apk` y toca **Instalar**. Si Android te lo pide, permite instalar apps de origen desconocido.
+5. Si ya tenías la app, se actualiza encima sin perder nada.
 
 ## Instalar en la tablet
 
