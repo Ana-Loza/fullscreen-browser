@@ -19,16 +19,4 @@ App Android que abre cualquier página web a pantalla completa, sin la barra de 
 4. En la tablet, abre el `.apk` y toca **Instalar**. Si Android te lo pide, permite instalar apps de origen desconocido.
 5. Si ya tenías la app, se actualiza encima sin perder nada.
 
-## Instalar en la tablet
 
-1. Copia el APK a la tablet (cable, Drive, etc.) y ábrelo.
-2. Acepta "instalar apps de origen desconocido" si Android lo pide.
-3. Abre **Fullscreen Browser** y escribe la URL del editor.
-
-Nota: el APK va firmado con la clave de depuración, sirve para instalar directo pero no para Play Store.
-
-## Siguientes pasos posibles
-
-- PIN para el menú oculto.
-- Fijar pantalla (screen pinning) o modo kiosko con Device Owner para que no se pueda salir.
-- Arrancar sola al encender la tablet.
